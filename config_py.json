@@ -2,7 +2,7 @@
   "sites": [
     {
       "key": "hongguo",
-      "name": "红果短剧",
+      "name": "🍎短剧",
       "type": 3,
       "api": "./hongguo_spider.py",
       "ext": {"playback": "stream"},
