@@ -282,11 +282,16 @@ class Spider(_BaseSpider):
             "X-SS-Req-Ticket": params["_rticket"],
             "X-SS-STUB": hashlib.md5(body.encode("utf-8")).hexdigest().upper(),
             "Referer": self.site + "/",
+            "x-argus": base64.b64encode(ts.to_bytes(4, "little")).decode(),
+            "x-ladon": base64.b64encode(ts.to_bytes(4, "big")).decode(),
         }
         req = urllib.request.Request(url, data=body.encode("utf-8"),
                                      headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
+            data = r.read()
+        if not data:
+            raise RuntimeError("video_model 空响应：风控头缺失或请求被拦截")
+        return json.loads(data.decode("utf-8", "replace"))
 
     # ------------------------------------------------------- CENC 内容密钥
     @staticmethod
