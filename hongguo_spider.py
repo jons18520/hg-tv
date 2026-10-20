@@ -191,6 +191,31 @@ class Spider(_BaseSpider):
         ("all", "综合", "/category"),
     ]
 
+    # 听书分类（通过番茄 App API 获取，需签名）
+    AUDIO_CATEGORIES = [
+        ("audio-all", "听书", 0),
+        ("audio-male", "男频听书", 1),
+        ("audio-female", "女频听书", 2),
+        ("audio-free", "免费听书", 3),
+        ("audio-rank", "听书热播榜", 4),
+    ]
+
+    # 听书 API 端点
+    AUDIO_API_HOST = "https://api5-normal-sinfonlineb.fqnovel.com"
+    AUDIO_SEARCH_API = "https://api5-normal-sinfonlinea.fqnovel.com"
+    AUDIO_PATHS = {
+        "detail": "/reading/bookapi/audio/detail/",
+        "playurl": "/reading/bookapi/audio/playurl/",
+        "batch_play": "/reading/bookapi/audio/batch_play/",
+        "bookstore_homepage": "/reading/bookapi/bookstore/homepage/v1/",
+        "bookmall_homepage": "/reading/bookapi/bookmall/homepage/v1/",
+        "bookmall_tab": "/reading/bookapi/bookmall/tab/v1/",
+        "category_newlist": "/reading/bookapi/category/newlist/v1/",
+        "category_ranklist": "/reading/bookapi/category_daily_ranklist/v1/",
+        "search_tab": "/reading/bookapi/search/tab/v",
+        "new_category_cell": "/reading/bookapi/new_category/cell/v1/",
+    }
+
     def __init__(self):
         self._cache = {}
         self.device_id = "2104954905733967953"
@@ -291,6 +316,64 @@ class Spider(_BaseSpider):
             data = r.read()
         if not data:
             raise RuntimeError("video_model 空响应：风控头缺失或请求被拦截")
+        return json.loads(data.decode("utf-8", "replace"))
+
+    def _post_signed_audio(self, path, payload, host=None):
+        """听书 API 调用（与 video_model 共享签名体系，但端点不同）"""
+        body = json.dumps(payload, separators=(',', ':'), ensure_ascii=False)
+        ts = int(time.time())
+        params = self._app_params()
+        params["_rticket"] = str(int(time.time() * 1000))
+        query = urllib.parse.urlencode(sorted(params.items()))
+        base = host or self.AUDIO_API_HOST
+        url = base + path + "?" + query
+        headers = {
+            "User-Agent": APP_UA,
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            "sdk-version": "2",
+            "X-Gorgon": self._sign(query, body, ts),
+            "X-Khronos": str(ts),
+            "X-SS-Req-Ticket": params["_rticket"],
+            "X-SS-STUB": hashlib.md5(body.encode("utf-8")).hexdigest().upper(),
+            "Referer": self.site + "/",
+            "x-argus": base64.b64encode(ts.to_bytes(4, "little")).decode(),
+            "x-ladon": base64.b64encode(ts.to_bytes(4, "big")).decode(),
+        }
+        req = urllib.request.Request(url, data=body.encode("utf-8"),
+                                     headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read()
+        if not data:
+            raise RuntimeError("audio API 空响应：风控头缺失或请求被拦截")
+        return json.loads(data.decode("utf-8", "replace"))
+
+    def _get_signed_audio(self, path, params_extra=None, host=None):
+        """听书 GET 接口（如 audio/detail/）"""
+        ts = int(time.time())
+        params = self._app_params()
+        params["_rticket"] = str(int(time.time() * 1000))
+        if params_extra:
+            params.update(params_extra)
+        query = urllib.parse.urlencode(sorted(params.items()))
+        base = host or self.AUDIO_API_HOST
+        url = base + path + "?" + query
+        headers = {
+            "User-Agent": APP_UA,
+            "Accept": "application/json",
+            "sdk-version": "2",
+            "X-Gorgon": self._sign(query, "", ts),
+            "X-Khronos": str(ts),
+            "X-SS-Req-Ticket": params["_rticket"],
+            "Referer": self.site + "/",
+            "x-argus": base64.b64encode(ts.to_bytes(4, "little")).decode(),
+            "x-ladon": base64.b64encode(ts.to_bytes(4, "big")).decode(),
+        }
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = r.read()
+        if not data:
+            raise RuntimeError("audio GET API 空响应")
         return json.loads(data.decode("utf-8", "replace"))
 
     # ------------------------------------------------------- CENC 内容密钥
@@ -442,8 +525,9 @@ class Spider(_BaseSpider):
 
     # -------------------------------------------------------------- 接口
     def homeContent(self, filter=False):
-        return {"class": [{"type_id": t, "type_name": n} for t, n, _ in self.CATEGORIES],
-                "filters": {}}
+        classes = [{"type_id": t, "type_name": n} for t, n, _ in self.CATEGORIES]
+        classes += [{"type_id": t, "type_name": n} for t, n, _ in self.AUDIO_CATEGORIES]
+        return {"class": classes, "filters": {}}
 
     def homeVideoContent(self):
         try:
@@ -454,6 +538,15 @@ class Spider(_BaseSpider):
             return {"list": []}
 
     def categoryContent(self, tid, pg, filter=False, extend=None):
+        # 听书分类
+        audio_cat = None
+        for t, _n, _id in self.AUDIO_CATEGORIES:
+            if t == str(tid):
+                audio_cat = _id
+                break
+        if audio_cat is not None:
+            return self._audio_category_content(audio_cat, pg, filter, extend)
+
         page = max(1, int(pg or 1))
         path = "/category"
         for t, _n, p in self.CATEGORIES:
@@ -477,8 +570,50 @@ class Spider(_BaseSpider):
             print("[红果] 分类失败:", exc)
             return {"list": [], "page": page, "pagecount": 1, "limit": 0, "total": 0}
 
+    def _audio_category_content(self, cat_id, pg, filter, extend):
+        """听书分类列表：通过番茄 App API 获取"""
+        page = max(1, int(pg or 1))
+        try:
+            # 使用 category/newlist 接口获取听书分类列表
+            payload = {
+                "category_id": cat_id,
+                "page": page,
+                "page_size": 24,
+                "sort_type": 1,  # 1=最热, 2=最新
+            }
+            if extend:
+                payload.update(extend)
+            resp = self._post_signed_audio(self.AUDIO_PATHS["category_newlist"], payload)
+            if resp.get("code") != 0:
+                print("[听书] 分类列表失败: code=%s" % resp.get("code"))
+                return {"list": [], "page": page, "pagecount": 1, "limit": 0, "total": 0}
+            data = resp.get("data") or {}
+            items = data.get("book_list") or data.get("list") or []
+            total = data.get("total") or 0
+            pagecount = data.get("page_count") or (total + 23) // 24
+            vod_list = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                vod_list.append({
+                    "vod_id": str(item.get("book_id") or item.get("id") or ""),
+                    "vod_name": str(item.get("book_name") or item.get("name") or ""),
+                    "vod_pic": str(item.get("cover_url") or item.get("cover") or ""),
+                    "type_name": ",".join(str(t) for t in (item.get("tags") or [])),
+                    "vod_remarks": str(item.get("audio_episode_cnt") or item.get("episode_cnt") or ""),
+                    "vod_content": str(item.get("description") or item.get("intro") or ""),
+                })
+            return {"list": vod_list, "page": page, "pagecount": pagecount,
+                    "limit": 24, "total": total}
+        except Exception as exc:
+            print("[听书] 分类列表异常:", exc)
+            return {"list": [], "page": page, "pagecount": 1, "limit": 0, "total": 0}
+
     def detailContent(self, ids):
         series_id = str(ids[0] if isinstance(ids, list) else ids)
+        # 判断是否为听书 ID（以 "audio_" 开头）
+        if series_id.startswith("audio_"):
+            return self._audio_detail_content(series_id[6:])
         url = self.site + "/detail?series_id=" + urllib.parse.quote(series_id)
         try:
             d = self._router_data(url)
@@ -507,11 +642,50 @@ class Spider(_BaseSpider):
             print("[红果] 详情失败:", exc)
             return {"list": []}
 
+    def _audio_detail_content(self, book_id):
+        """听书详情：通过 audio/detail/ 接口获取"""
+        try:
+            resp = self._get_signed_audio(self.AUDIO_PATHS["detail"],
+                                          {"book_id": book_id})
+            if resp.get("code") != 0:
+                print("[听书] 详情失败: code=%s" % resp.get("code"))
+                return {"list": []}
+            data = resp.get("data") or {}
+            book_info = data.get("book_info") or data
+            # 获取章节列表
+            chapter_list = data.get("chapter_list") or data.get("audio_chapters") or []
+            episodes = []
+            for ch in chapter_list:
+                if not isinstance(ch, dict):
+                    continue
+                ch_id = str(ch.get("chapter_id") or ch.get("id") or "")
+                ch_name = str(ch.get("chapter_name") or ch.get("name") or "")
+                if ch_id:
+                    episodes.append("%s$%s" % (ch_name, ch_id))
+            vod = {
+                "vod_id": "audio_" + book_id,
+                "vod_name": str(book_info.get("book_name") or book_info.get("name") or ""),
+                "vod_pic": str(book_info.get("cover_url") or book_info.get("cover") or ""),
+                "type_name": ",".join(str(t) for t in (book_info.get("tags") or [])),
+                "vod_remarks": str(book_info.get("audio_episode_cnt") or len(episodes)),
+                "vod_actor": str(book_info.get("author") or ""),
+                "vod_content": str(book_info.get("description") or book_info.get("intro") or ""),
+                "vod_play_from": "番茄听书",
+                "vod_play_url": "#".join(episodes),
+            }
+            return {"list": [vod]}
+        except Exception as exc:
+            print("[听书] 详情异常:", exc)
+            return {"list": []}
+
     def searchContent(self, key, quick=False, pg="1"):
         page = max(1, int(pg or 1))
         kw = str(key or "").strip().lower()
         if not kw:
             return {"list": [], "page": page, "pagecount": 1}
+        # 听书搜索
+        if kw.startswith("audio:"):
+            return self._audio_search_content(kw[6:], page)
         per_page = 24
         found, seen = [], set()
         try:
@@ -540,8 +714,45 @@ class Spider(_BaseSpider):
             print("[红果] 搜索失败:", exc)
             return {"list": [], "page": page, "pagecount": 1}
 
+    def _audio_search_content(self, keyword, page):
+        """听书搜索：通过 search/tab 接口搜索听书"""
+        try:
+            resp = self._post_signed_audio(self.AUDIO_PATHS["search_tab"], {
+                "keyword": keyword,
+                "page": page,
+                "page_size": 24,
+                "tab_type": 2,  # 2=听书tab
+            }, host=self.AUDIO_SEARCH_API)
+            if resp.get("code") != 0:
+                print("[听书] 搜索失败: code=%s" % resp.get("code"))
+                return {"list": [], "page": page, "pagecount": 1}
+            data = resp.get("data") or {}
+            items = data.get("book_list") or data.get("list") or []
+            total = data.get("total") or 0
+            vod_list = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                vod_list.append({
+                    "vod_id": "audio_" + str(item.get("book_id") or item.get("id") or ""),
+                    "vod_name": str(item.get("book_name") or item.get("name") or ""),
+                    "vod_pic": str(item.get("cover_url") or item.get("cover") or ""),
+                    "type_name": ",".join(str(t) for t in (item.get("tags") or [])),
+                    "vod_remarks": str(item.get("audio_episode_cnt") or ""),
+                    "vod_content": str(item.get("description") or item.get("intro") or ""),
+                })
+            return {"list": vod_list, "page": page,
+                    "pagecount": max(1, (total + 23) // 24),
+                    "limit": 24, "total": total}
+        except Exception as exc:
+            print("[听书] 搜索异常:", exc)
+            return {"list": [], "page": page, "pagecount": 1}
+
     # -------------------------------------------------------------- 播放
     def playerContent(self, flag, pid, vipFlags=None):
+        # 听书播放
+        if str(pid).startswith("audio_"):
+            return self._audio_player_content(pid[6:])
         vid = str(pid)
         try:
             media = self._resolve_media(vid)
@@ -574,6 +785,51 @@ class Spider(_BaseSpider):
                 "forceKey": True,
             }
         return result
+
+    def _audio_player_content(self, chapter_id):
+        """听书播放：通过 audio/playurl/ 接口获取音频流地址"""
+        try:
+            resp = self._post_signed_audio(self.AUDIO_PATHS["playurl"], {
+                "chapter_id": chapter_id,
+                "book_id": "",
+                "quality": "high",  # high=高品质, standard=标准
+            })
+            if resp.get("code") != 0:
+                print("[听书] 播放地址获取失败: code=%s" % resp.get("code"))
+                return {"parse": 0, "url": "", "header": {}}
+            data = resp.get("data") or {}
+            audio_info = data.get("audio_info") or data
+            # 获取音频流 URL
+            audio_url = (audio_info.get("url") or audio_info.get("play_url")
+                         or data.get("url") or data.get("play_url") or "")
+            if not audio_url:
+                print("[听书] 未获取到音频流地址")
+                return {"parse": 0, "url": "", "header": {}}
+            # 检查是否需要加密
+            is_encrypt = audio_info.get("is_encrypt") or data.get("is_encrypt") or False
+            if is_encrypt:
+                # 音频加密处理：使用 encryption_key 解密
+                encryption_key = (audio_info.get("encryption_key")
+                                  or data.get("encryption_key") or "")
+                if encryption_key:
+                    # TODO: 实现音频流解密逻辑
+                    print("[听书] 音频已加密，需要解密处理")
+                    # 暂时直接返回，后续补充解密
+                    return {"parse": 0, "url": audio_url, "header": {
+                        "User-Agent": APP_UA,
+                        "Referer": "https://novel.snssdk.com/",
+                    }}
+            return {
+                "parse": 0,
+                "url": audio_url,
+                "header": {
+                    "User-Agent": APP_UA,
+                    "Referer": "https://novel.snssdk.com/",
+                },
+            }
+        except Exception as exc:
+            print("[听书] 播放异常:", exc)
+            return {"parse": 0, "url": "", "header": {}}
 
     def _license_url(self, kid, key_hex):
         base = self.license_base or self._detect_license_base()
